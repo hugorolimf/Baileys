@@ -23,13 +23,47 @@ npx tsx ./src/server.ts
 # ou
 yarn start:api
 ```
-A API por padrão escuta na porta 3000.
+A API por padrão escuta na porta 3009.
 
 ---
 
-## Endpoints
 
-Todos os endpoints aceitam/retornam JSON e ficam em `http://<host>:<port>` (ex.: `http://localhost:3000`).
+## Exemplos prontos em cURL
+
+### Criar/retomar sessão
+```bash
+curl -X POST http://localhost:3009/connect \
+    -H "Content-Type: application/json" \
+    -d '{"userId":"cliente_abc"}'
+```
+
+### Verificar status da sessão
+```bash
+curl http://localhost:3009/status/s_169941...
+```
+
+### Obter QR code (data URL)
+```bash
+curl http://localhost:3009/qr/s_169941...
+```
+
+### Enviar mensagem
+```bash
+curl -X POST http://localhost:3009/send \
+    -H "Content-Type: application/json" \
+    -d '{"sessionId":"s_169941...","jid":"5511999999999@s.whatsapp.net","text":"Olá do API"}'
+```
+
+### Desconectar sessão
+```bash
+curl -X POST http://localhost:3009/disconnect \
+    -H "Content-Type: application/json" \
+    -d '{"sessionId":"s_169941..."}'
+```
+
+---
+
+Todos os endpoints aceitam/retornam JSON e ficam em `http://<host>:<port>` (ex.: `http://localhost:3009`).
 
 ### 1) POST /connect
 Cria ou retoma uma sessão do Baileys. Se um `userId` for fornecido e já existir sessão associada, a sessão existente será retornada.
@@ -56,6 +90,19 @@ Observação: o servidor também imprime um QR quadro pequeno no terminal para f
 
 ### 2) GET /status/:sessionId
 Retorna o estado atual da sessão.
+Agora inclui também informações de reconexão automática:
+
+Campos adicionais:
+- `lastDisconnect` (opcional): objeto com últimos dados da desconexão
+    - `code`: statusCode (quando disponível) retornado pelo WhatsApp (ex.: 515, 503, 440, etc.)
+    - `reason`: tag ou mensagem (ex.: `stream:error`, `conflict`, `ack`, `restart required`)
+    - `at`: ISO timestamp do momento em que foi registrada
+- `reconnectAttempts`: número de tentativas de reconexão realizadas desde a última conexão aberta bem-sucedida.
+
+Comportamento de auto‑reconexão:
+- Se a desconexão não for definitiva (não estiver em uma lista de códigos considerados finais como 401/403/405/428/440), o servidor agenda um retry com backoff exponencial (1s, 2s, 4s, 8s, até máximo 30s).
+- Ao reconectar com sucesso (`connection === 'open'`), o contador `reconnectAttempts` é zerado.
+- Para códigos finais (ex.: logout), a sessão permanece `closed` e não tenta reconectar.
 
 Exemplo:
 ```
@@ -146,20 +193,20 @@ Este servidor é um exemplo funcional. Antes de expor em produção, implemente:
 ## Exemplo rápido em Node.js (fetch)
 ```js
 // criar/retomar sessão
-const res = await fetch('http://localhost:3000/connect', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ userId: 'cliente_abc' })
+const res = await fetch('http://localhost:3009/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userId: 'cliente_abc' })
 })
 const data = await res.json()
 console.log(data)
 // se data.qr for dataURL, exiba no frontend
 
 // enviar mensagem
-await fetch('http://localhost:3000/send', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ sessionId: data.sessionId, jid: '5511999999999@s.whatsapp.net', text: 'Olá' })
+await fetch('http://localhost:3009/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId: data.sessionId, jid: '5511999999999@s.whatsapp.net', text: 'Olá' })
 })
 ```
 
@@ -173,3 +220,53 @@ await fetch('http://localhost:3000/send', {
 ---
 
 Se quiser, eu adapto a documentação para um formato mais amigável (OpenAPI / Swagger), ou adiciono exemplos prontos em cURL/JS/ts para cada endpoint e uma pequena UI estática para exibir o QR e enviar mensagens.
+
+---
+
+## Reconexão automática (detalhes técnicos)
+
+Implementação (ver `src/server.ts`):
+- Ao receber `connection === 'close'`, captura `lastDisconnect.error.output.statusCode` e `lastDisconnect.error.data.tag`.
+- Mantém lista de códigos considerados finais: `401, 403, 405, 428, 440`.
+- Para demais códigos, agenda `setTimeout` com backoff exponencial: `delay = min(1000 * 2^(n-1), 30000)`.
+- Substitui o socket dentro do mesmo objeto de sessão (mantém `sessionId` e caminho de credenciais) para reaproveitar login sem novo QR quando possível.
+- Reseta tentativa (`reconnectAttempts = 0`) quando `connection === 'open'`.
+
+Exemplo de resposta após uma queda temporária:
+```json
+{
+    "sessionId": "s_169941...",
+    "status": "closed",
+    "qr": null,
+    "lastDisconnect": {
+        "code": 515,
+        "reason": "stream:error",
+        "at": "2025-11-07T12:34:56.123Z"
+    },
+    "reconnectAttempts": 2
+}
+```
+
+Logo após isso, quando a reconexão abrir:
+```json
+{
+    "sessionId": "s_169941...",
+    "status": "open",
+    "qr": null,
+    "reconnectAttempts": 0
+}
+```
+
+---
+
+## Troubleshooting rápido
+
+| Sintoma | Possível causa | Ação sugerida |
+|--------|----------------|---------------|
+| Código 515 / 503 intermitente | Instabilidade lado WA ou handshake reiniciado | Confiar no backoff; apenas alertar se frequência muito alta |
+| Código 440 / 405 / 401 | Sessão finalizada (logout / método não permitido) | Exigir novo QR: recriar sessão (`POST /connect`) |
+| Ciclo infinito de reconexão sem abrir | Credenciais corrompidas ou bloqueio no número | Apagar pasta `sessions/<sessionId>` e reconectar via QR |
+| `conflict` em `lastDisconnect.reason` | Outra instância usando a mesma conta | Encerrar outras sessões; garantir uma única execução |
+| `ack` stream errored logo após enviar mídia | Possível condição específica de mídia | Testar envio de mídia menor; atualizar lib; abrir issue com logs |
+
+Para reportar: inclua `lastDisconnect.raw` (log completo) e versão do Node/Baileys.
