@@ -4,6 +4,7 @@ import pino from 'pino'
 import makeWASocket, { fetchLatestBaileysVersion, useMultiFileAuthState } from '.'
 import { makeCacheableSignalKeyStore } from './Utils/auth-utils'
 import qrcode from 'qrcode-terminal'
+import qrcodeLib from 'qrcode'
 
 const app = express()
 app.use(express.json())
@@ -16,16 +17,27 @@ type Session = {
   saveCreds: () => Promise<void>
   status: string
   qr?: string
+  qrDataUrl?: string
 }
 
 const sessions = new Map<string, Session>()
+// map external user id -> sessionId
+const userSessions = new Map<string, string>()
 
 function genId() {
   return `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
-app.post('/connect', async (req, res) => {
+app.post('/connect', async (req: express.Request, res: express.Response) => {
   const providedId = req.body?.sessionId as string | undefined
+  const userId = req.body?.userId as string | undefined
+
+  // if userId already has a session, return it
+  if (userId && userSessions.has(userId)) {
+    const existing = userSessions.get(userId) as string
+    const s = sessions.get(existing)
+    return res.json({ sessionId: existing, status: s?.status, qr: s?.qrDataUrl })
+  }
   const sessionId = providedId || genId()
 
   if (sessions.has(sessionId)) {
@@ -49,6 +61,7 @@ app.post('/connect', async (req, res) => {
 
     const s: Session = { id: sessionId, sock, saveCreds, status: 'connecting' }
     sessions.set(sessionId, s)
+    if (userId) userSessions.set(userId, sessionId)
 
     // connection updates
     sock.ev.on('connection.update', (update: any) => {
@@ -59,6 +72,12 @@ app.post('/connect', async (req, res) => {
         try {
           // print a compact QR in the terminal for quick scanning
           qrcode.generate(qr, { small: true })
+          // also generate a data URL PNG for the client to fetch
+          try {
+            qrcodeLib.toDataURL(qr).then((dataUrl: string) => {
+              ;(s as any).qrDataUrl = dataUrl
+            }).catch(() => {})
+          } catch {}
         } catch (e) {
           // ignore if terminal QR fails
         }
@@ -74,14 +93,14 @@ app.post('/connect', async (req, res) => {
     // save creds when updated
     sock.ev.on('creds.update', saveCreds)
 
-    return res.json({ sessionId, status: s.status, qr: s.qr })
+    return res.json({ sessionId, status: s.status, qr: s.qrDataUrl || s.qr })
   } catch (error) {
     logger.error({ err: error }, 'failed to create session')
     return res.status(500).json({ error: String(error) })
   }
 })
 
-app.post('/send', async (req, res) => {
+app.post('/send', async (req: express.Request, res: express.Response) => {
   const { sessionId, jid, text } = req.body || {}
   if (!sessionId || !jid || !text) return res.status(400).json({ error: 'sessionId, jid and text are required' })
 
@@ -97,13 +116,26 @@ app.post('/send', async (req, res) => {
   }
 })
 
-app.get('/status/:sessionId', (req, res) => {
-  const s = sessions.get(req.params.sessionId)
+app.get('/status/:sessionId', (req: express.Request, res: express.Response) => {
+  const sessionId = req.params.sessionId as string | undefined
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' })
+  const s = sessions.get(sessionId)
   if (!s) return res.status(404).json({ error: 'not found' })
-  return res.json({ sessionId: s.id, status: s.status, qr: s.qr })
+  return res.json({ sessionId: s.id, status: s.status, qr: s.qrDataUrl || s.qr })
 })
 
-app.post('/disconnect', async (req, res) => {
+// return QR as dataURL for the client (convenience endpoint)
+app.get('/qr/:sessionId', (req: express.Request, res: express.Response) => {
+  const sessionId = req.params.sessionId as string | undefined
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' })
+  const s = sessions.get(sessionId)
+  if (!s) return res.status(404).json({ error: 'not found' })
+  const dataUrl = s.qrDataUrl || s.qr
+  if (!dataUrl) return res.status(404).json({ error: 'qr not available yet' })
+  return res.json({ sessionId: s.id, qr: dataUrl })
+})
+
+app.post('/disconnect', async (req: express.Request, res: express.Response) => {
   const { sessionId } = req.body || {}
   if (!sessionId) return res.status(400).json({ error: 'sessionId required' })
   const s = sessions.get(sessionId)
@@ -115,6 +147,8 @@ app.post('/disconnect', async (req, res) => {
       await s.sock.logout?.()
     } catch {}
     sessions.delete(sessionId)
+    // remove any userSessions pointing to this session
+    for (const [u, sid] of userSessions.entries()) if (sid === sessionId) userSessions.delete(u)
     return res.json({ ok: true })
   } catch (err) {
     return res.status(500).json({ error: String(err) })
