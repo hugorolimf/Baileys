@@ -5,6 +5,7 @@ import makeWASocket, { fetchLatestBaileysVersion, useMultiFileAuthState } from '
 import { makeCacheableSignalKeyStore } from './Utils/auth-utils'
 import qrcode from 'qrcode-terminal'
 import qrcodeLib from 'qrcode'
+import { readdir, stat } from 'fs/promises'
 
 const app = express()
 app.use(express.json())
@@ -205,7 +206,50 @@ app.post('/disconnect', async (req: express.Request, res: express.Response) => {
 })
 
 const port = process.env.PORT ? Number(process.env.PORT) : 3009
-app.listen(port, () => logger.info({ port }, 'Baileys API listening'))
+
+// on startup: load any existing session folders and attempt reconnection
+async function loadExistingSessions() {
+  const sessionsDir = path.join(process.cwd(), 'sessions')
+  try {
+    const entries = await readdir(sessionsDir)
+    for (const name of entries) {
+      try {
+        const full = path.join(sessionsDir, name)
+        const s = await stat(full)
+        if (s.isDirectory()) {
+          // if we don't already have it in memory, create/reconnect
+          if (!sessions.has(name)) {
+            logger.info({ sessionId: name }, 'loading session from disk')
+            createOrReconnectSession(name).catch(err => {
+              logger.error({ err, sessionId: name }, 'failed to load session on startup')
+            })
+          }
+        }
+      } catch (err) {
+        // ignore single entry errors
+        logger.warn({ err, entry: name }, 'skipping session entry')
+      }
+    }
+  } catch (err: any) {
+    // if folder doesn't exist, just skip
+    if (err.code === 'ENOENT') {
+      logger.info('no sessions directory, skipping load')
+      return
+    }
+    logger.error({ err }, 'failed to read sessions directory')
+  }
+}
+
+// start server and then load sessions
+app.listen(port, async () => {
+  logger.info({ port }, 'Baileys API listening')
+  // try to restore sessions persisted on disk
+  try {
+    await loadExistingSessions()
+  } catch (err) {
+    logger.error({ err }, 'error while loading existing sessions')
+  }
+})
 
 // export for tests
 export default app

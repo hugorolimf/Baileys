@@ -37,6 +37,15 @@ curl -X POST http://localhost:3009/connect \
     -d '{"userId":"cliente_abc"}'
 ```
 
+curl http://localhost:3009/sessions
+
+curl http://localhost:3009/status/<sessionId>
+
+
+curl -X POST http://localhost:3009/send \
+  -H "Content-Type: application/json" \
+  -d '{"sessionId":"s_1762553680835_wms65u","jid":"5511999999999@s.whatsapp.net","text":"Teste após restart"}'
+
 ### Verificar status da sessão
 ```bash
 curl http://localhost:3009/status/s_169941...
